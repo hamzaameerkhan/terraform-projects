@@ -1,0 +1,150 @@
+{
+    "description": "Launch Automation for Ubuntu Linux instance",
+    "schemaVersion": "0.3",
+    "parameters": {
+        "instanceIds": {
+            "type": "StringList",
+            "description": "InstanceIds to run launch setup"
+        }
+    },
+    "mainSteps": [{
+            "name": "waitForInstancesToStart",
+            "action": "aws:changeInstanceState",
+            "timeoutSeconds": 600,
+            "onFailure": "Abort",
+            "inputs": {
+                "InstanceIds": [
+                    "{{instanceIds}}"
+                ],
+                "CheckStateOnly": true,
+                "DesiredState": "running"
+            },
+            "nextStep": "installdependencies"
+        },
+        {
+            "name": "installdependencies",
+            "action": "aws:runCommand",
+            "onFailure": "Continue",
+            "inputs": {
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds": ["{{instanceIds}}"],
+                "Parameters": {
+                    "commands": [
+                        "sudo su -\n",
+                        "apt-get update -y\n",
+                        "curl -O https://bootstrap.pypa.io/get-pip.py\n",
+                        "python get-pip.py\n",
+                        "pip install awscli\n",
+                        "apt-get install sssd realmd krb5-user packagekit oddjob oddjob-mkhomedir samba-common samba-common-tools krb5-workstation openldap-clients policycoreutils-python -y\n",
+                        "echo Packages are installed"
+                    ]
+                }
+            },
+            "nextStep": "changeHostname"
+        },
+        {
+            "name": "changeHostname",
+            "action": "aws:runCommand",
+            "onFailure": "Abort",
+            "inputs": {
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds": ["{{instanceIds}}"],
+                "Parameters": {
+                    "commands": [
+                        "sudo su -",
+                        "domain=$(aws ssm get-parameters --names /domain/name --region ap-south-1 --query 'Parameters[0].Value' --output text)\n",
+                        "if realm list |grep $domain; then echo \"Host has already joined $domain so exiting\"; exit -1; fi;\n",
+                        "instanceId=$(curl http://169.254.169.254/latest/meta-data/instance-id)\n",
+                        "hostname=$(aws ec2 describe-instances --instance-id $instanceId --region ap-south-1 --query 'Reservations[0].Instances[0].Tags[?Key==`hostname`].Value' --output text)\n",
+                        "ipv4=$(curl http://169.254.169.254/latest/meta-data/local-ipv4)\n",
+                        "if [ -z \"$hostname\" ]; then echo \"hostname (case sensitive) tag is not defined so exiting\"; exit -1; fi\n",
+                        "echo $hostname.$domain > /etc/hostname\n",
+                        "echo 127.0.0.1 $hostname.$domain > /etc/hosts\n",
+                        "echo \"$ipv4 $hostname\" >> /etc/hosts\n",
+                        "echo \"Hostname has changed and rebooting now\"\n",
+                        "reboot"
+                    ]
+                }
+            },
+            "nextStep": "waitForInstancesToStartAfterReboot"
+        },
+        {
+            "name": "waitForInstancesToStartAfterReboot",
+            "action": "aws:changeInstanceState",
+            "timeoutSeconds": 600,
+            "onFailure": "Abort",
+            "inputs": {
+                "InstanceIds": [
+                    "{{instanceIds}}"
+                ],
+                "CheckStateOnly": true,
+                "DesiredState": "running"
+            },
+            "nextStep": "joinDomain"
+        },
+        {
+            "name": "joinDomain",
+            "action": "aws:runCommand",
+            "onFailure": "Abort",
+            "inputs": {
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds": ["{{instanceIds}}"],
+                "Parameters": {
+                    "commands": [
+                        "domain=$(aws ssm get-parameters --names /domain/name --region ap-south-1 --query 'Parameters[0].Value' --output text)\n",
+                        "ouPath=$(aws ssm get-parameters --names /domain/ou_path --region ap-south-1 --query 'Parameters[0].Value' --output text)\n",
+                        "username=$(aws ssm get-parameters --names /domain/username --region ap-south-1 --query 'Parameters[0].Value' --output text)\n",
+                        "password=$(aws ssm get-parameters --names /domain/password --with-decryption --region ap-south-1 --query 'Parameters[0].Value' --output text)\n",
+                        "for i in 1 2 3 4 5;\n",
+                        "do\n",
+                        "echo $password | sudo realm join --membership-software=samba -U $username --computer-ou=$ouPath $domain && echo \"Host has joined domain successfully after $i retries\" && break;\n",
+                        "done\n",
+                        "if ! sudo realm list |grep $domain; then echo \"Host has not joined $domain so exiting\"; exit -1; fi;\n",
+                        "sudo shutdown -r 1"
+                    ]
+                }
+            }
+        },
+        {
+            "name": "waitForInstancesToStartAfterDomainJoin",
+            "action": "aws:changeInstanceState",
+            "timeoutSeconds": 600,
+            "onFailure": "Abort",
+            "inputs": {
+                "InstanceIds": [
+                    "{{instanceIds}}"
+                ],
+                "CheckStateOnly": true,
+                "DesiredState": "running"
+            },
+            "nextStep": "modifySSSD"
+        },
+        {
+            "name": "modifySSSD",
+            "action": "aws:runCommand",
+            "onFailure": "Abort",
+            "inputs": {
+                "DocumentName": "AWS-RunShellScript",
+                "InstanceIds": ["{{instanceIds}}"],
+                "Parameters": {
+                    "commands": [
+                        "sudo su -\n",
+                        "domain=`realm list|head -1`\n",
+                        "cp /etc/sssd/sssd.conf /etc/sssd/sssd.conf.backup\n",
+                        "echo dyndns_update = true >> /etc/sssd/sssd.conf\n",
+                        "echo dyndns_refresh_interval = 43200 >> /etc/sssd/sssd.conf\n",
+                        "echo dyndns_update_ptr = true >> /etc/sssd/sssd.conf\n",
+                        "echo dyndns_ttl = 3600 >> /etc/sssd/sssd.conf\n",
+                        "echo Updated sssd.conf, now restarting sssd service\n",
+                        "/bin/systemctl restart sssd.service\n",
+                        "cp /etc/ssh/sshd_config  /etc/ssh/sshd_config.backup\n",
+                        "sed -i -e 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config\n",
+                        "echo Updated sshd_config, now restarting sshd service\n",
+                        "/bin/systemctl restart sshd.service\n",
+                        "echo \"${sudoers}@$domain ALL=(ALL) ALL\" >> /etc/sudoers.d/${sudoers}"
+                    ]
+                }
+            }
+        }
+    ]
+}
